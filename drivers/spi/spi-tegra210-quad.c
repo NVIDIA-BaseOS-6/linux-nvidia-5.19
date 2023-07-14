@@ -165,13 +165,13 @@
 struct tegra_qspi_soc_data {
 	bool has_dma;
 	bool cmb_xfer_capable;
+	bool supports_tpm;
 	unsigned int cs_count;
 };
 
 struct tegra_qspi_client_data {
 	int tx_clk_tap_delay;
 	int rx_clk_tap_delay;
-	bool wait_polling;
 };
 
 struct tegra_qspi {
@@ -936,8 +936,6 @@ static struct tegra_qspi_client_data *tegra_qspi_parse_cdata_dt(struct spi_devic
 				 &cdata->tx_clk_tap_delay);
 	device_property_read_u32(&spi->dev, "nvidia,rx-clk-tap-delay",
 				 &cdata->rx_clk_tap_delay);
-	cdata->wait_polling =
-		device_property_read_bool(&spi->dev, "nvidia,wait-polling");
 
 	return cdata;
 }
@@ -995,14 +993,6 @@ static void tegra_qspi_dump_regs(struct tegra_qspi *tqspi)
 	dev_dbg(tqspi->dev, "TRANS_STAT:  0x%08x | FIFO_STATUS: 0x%08x\n",
 		tegra_qspi_readl(tqspi, QSPI_TRANS_STATUS),
 		tegra_qspi_readl(tqspi, QSPI_FIFO_STATUS));
-	dev_dbg(tqspi->dev, "GLOBAL_CFG: 0x%08x\n",
-		tegra_qspi_readl(tqspi, QSPI_GLOBAL_CONFIG));
-	dev_dbg(tqspi->dev, "CMB_CMD: 0x%08x | CMB_CMD_CFG: 0x%08x\n",
-		tegra_qspi_readl(tqspi, QSPI_CMB_SEQ_CMD),
-		tegra_qspi_readl(tqspi, QSPI_CMB_SEQ_CMD_CFG));
-	dev_dbg(tqspi->dev, "CMB_ADDR: 0x%08x | CMB_ADDR_CFG: 0x%08x\n",
-		tegra_qspi_readl(tqspi, QSPI_CMB_SEQ_ADDR),
-		tegra_qspi_readl(tqspi, QSPI_CMB_SEQ_ADDR_CFG));
 }
 
 static void tegra_qspi_handle_error(struct tegra_qspi *tqspi)
@@ -1068,7 +1058,6 @@ static int tegra_qspi_combined_seq_xfer(struct tegra_qspi *tqspi,
 	bool is_first_msg = true;
 	struct spi_transfer *xfer;
 	struct spi_device *spi = msg->spi;
-	struct tegra_qspi_client_data *cdata = spi->controller_data;
 	u8 transfer_phase = 0;
 	u32 cmd1 = 0, dma_ctl = 0;
 	int ret = 0;
@@ -1078,8 +1067,12 @@ static int tegra_qspi_combined_seq_xfer(struct tegra_qspi *tqspi,
 
 	/* Enable Combined sequence mode */
 	val = tegra_qspi_readl(tqspi, QSPI_GLOBAL_CONFIG);
-	if (cdata->wait_polling)
-		val |= QSPI_TPM_WAIT_POLL_EN;
+	if (spi->mode & SPI_TPM_HW_FLOW) {
+		if (tqspi->soc_data->supports_tpm)
+			val |= QSPI_TPM_WAIT_POLL_EN;
+		else
+			return -EIO;
+	}
 	val |= QSPI_CMB_SEQ_EN;
 	tegra_qspi_writel(tqspi, val, QSPI_GLOBAL_CONFIG);
 	/* Process individual transfer list */
@@ -1096,7 +1089,6 @@ static int tegra_qspi_combined_seq_xfer(struct tegra_qspi *tqspi,
 			addr_config = tegra_qspi_addr_config(false, 0,
 							     xfer->len);
 			address_value = *((const u32 *)(xfer->tx_buf));
-			address_value &= (1 << (xfer->len * 8)) -1;
 			break;
 		case DATA_TRANSFER:
 			/* Program Command, Address value in register */
@@ -1108,6 +1100,7 @@ static int tegra_qspi_combined_seq_xfer(struct tegra_qspi *tqspi,
 					  QSPI_CMB_SEQ_CMD_CFG);
 			tegra_qspi_writel(tqspi, addr_config,
 					  QSPI_CMB_SEQ_ADDR_CFG);
+
 			reinit_completion(&tqspi->xfer_completion);
 			cmd1 = tegra_qspi_setup_transfer_one(spi, xfer,
 							     is_first_msg);
@@ -1171,22 +1164,26 @@ static int tegra_qspi_combined_seq_xfer(struct tegra_qspi *tqspi,
 				ret = -EIO;
 				goto exit;
 			}
+			if (!xfer->cs_change) {
+				tegra_qspi_transfer_end(spi);
+				spi_transfer_delay_exec(xfer);
+			}
 			break;
 		default:
 			ret = -EINVAL;
 			goto exit;
 		}
 		msg->actual_length += xfer->len;
-		if (!xfer->cs_change && transfer_phase == DATA_TRANSFER) {
-			tegra_qspi_transfer_end(spi);
-			spi_transfer_delay_exec(xfer);
-		}
 		transfer_phase++;
 	}
 	ret = 0;
 
 exit:
 	msg->status = ret;
+	if (ret < 0) {
+		tegra_qspi_transfer_end(spi);
+		spi_transfer_delay_exec(xfer);
+	}
 
 	return ret;
 }
@@ -1207,7 +1204,8 @@ static int tegra_qspi_non_combined_seq_xfer(struct tegra_qspi *tqspi,
 	/* Disable Combined sequence mode */
 	val = tegra_qspi_readl(tqspi, QSPI_GLOBAL_CONFIG);
 	val &= ~QSPI_CMB_SEQ_EN;
-	val &= ~QSPI_TPM_WAIT_POLL_EN;
+	if (tqspi->soc_data->supports_tpm)
+		val &= ~QSPI_TPM_WAIT_POLL_EN;
 	tegra_qspi_writel(tqspi, val, QSPI_GLOBAL_CONFIG);
 	list_for_each_entry(transfer, &msg->transfers, transfer_list) {
 		struct spi_transfer *xfer = transfer;
@@ -1466,24 +1464,28 @@ static irqreturn_t tegra_qspi_isr_thread(int irq, void *context_data)
 static struct tegra_qspi_soc_data tegra210_qspi_soc_data = {
 	.has_dma = true,
 	.cmb_xfer_capable = false,
+	.supports_tpm = false,
 	.cs_count = 1,
 };
 
 static struct tegra_qspi_soc_data tegra186_qspi_soc_data = {
 	.has_dma = true,
 	.cmb_xfer_capable = true,
+	.supports_tpm = false,
 	.cs_count = 1,
 };
 
 static struct tegra_qspi_soc_data tegra234_qspi_soc_data = {
 	.has_dma = false,
 	.cmb_xfer_capable = true,
+	.supports_tpm = true,
 	.cs_count = 1,
 };
 
 static struct tegra_qspi_soc_data tegra241_qspi_soc_data = {
 	.has_dma = false,
 	.cmb_xfer_capable = true,
+	.supports_tpm = true,
 	.cs_count = 4,
 };
 
@@ -1548,6 +1550,7 @@ static int tegra_qspi_probe(struct platform_device *pdev)
 	master->mode_bits = SPI_MODE_0 | SPI_MODE_3 | SPI_CS_HIGH |
 			    SPI_TX_DUAL | SPI_RX_DUAL | SPI_TX_QUAD | SPI_RX_QUAD;
 	master->bits_per_word_mask = SPI_BPW_MASK(32) | SPI_BPW_MASK(16) | SPI_BPW_MASK(8);
+	master->flags = SPI_CONTROLLER_HALF_DUPLEX;
 	master->setup = tegra_qspi_setup;
 	master->transfer_one_message = tegra_qspi_transfer_one_message;
 	master->num_chipselect = 1;
